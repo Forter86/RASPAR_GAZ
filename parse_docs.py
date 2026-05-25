@@ -422,6 +422,14 @@ def _md_escape_cell(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ").strip()
 
 
+def _md_bold_cell(s: str) -> str:
+    """Экранирование + выделение ключевой ячейки строки для RAG."""
+    escaped = _md_escape_cell(s)
+    if not escaped:
+        return ""
+    return f"**{escaped}**"
+
+
 def _compact_row(row: list[str]) -> list[str]:
     """Сворачиваем подряд идущие дубли (последствие colspan-разворота)."""
     out: list[str] = []
@@ -432,7 +440,266 @@ def _compact_row(row: list[str]) -> list[str]:
     return out
 
 
-def _matrix_to_markdown(matrix: list[list[str]], kind: str) -> str:
+def _is_numbering_row(row: list[str]) -> bool:
+    """Строка вида 1 | 2 | 3 | ... — это нумерация колонок, не данные."""
+    cells = [c.strip() for c in row if c.strip()]
+    if len(cells) < 2:
+        return False
+    return all(re.fullmatch(r"\d{1,2}", c) for c in cells)
+
+
+def _looks_like_table_header(row: list[str]) -> bool:
+    """Определяем реальную шапку таблицы: короткие названия колонок."""
+    cells = [c.strip() for c in row if c.strip()]
+    if len(cells) < 2:
+        return False
+    if _is_numbering_row(row):
+        return False
+    if not all(len(c) <= 260 for c in cells):
+        return False
+    header_words = (
+        "вид", "наименование", "код", "уровень", "требован", "кто",
+        "каких", "случа", "провод", "документ", "срок", "единиц",
+        "количество", "расход", "обоснование", "параметр", "значение",
+        "функц", "професс", "специальност",
+    )
+    joined = " ".join(cells).lower()
+    return any(w in joined for w in header_words)
+
+
+def _render_row_cells(row: list[str], width: int, bold_first: bool = True) -> str:
+    """Рендер строки markdown-таблицы, где первая ячейка — индекс строки."""
+    padded = row + [""] * (width - len(row))
+    rendered: list[str] = []
+    for i, cell in enumerate(padded[:width]):
+        if i == 0 and bold_first and cell.strip():
+            rendered.append(_md_bold_cell(cell))
+        else:
+            rendered.append(_md_escape_cell(cell))
+    return "| " + " | ".join(rendered) + " |"
+
+
+# --- Семантический инференс шапки таблицы ------------------------------------
+
+# Регулярки для типов значений в первой/второй колонке.
+_RE_CODE_OKZ = re.compile(r"^\d{3,4}$")                      # 1212, 2149
+_RE_CODE_OKVED = re.compile(r"^\d{2}\.\d{1,3}(\.\d+)?$")      # 74.90
+_RE_CODE_PROFSTD = re.compile(r"^\d{2}\.\d{3,4}$")            # 40.054
+_RE_CODE_OKSO = re.compile(r"^\d\.\d{2}\.\d{2}\.\d{2}$")      # 2.20.03.01
+_RE_LETTER_CODE = re.compile(r"^[A-ZА-ЯЁ]$")                  # A, B, C
+_RE_FUNC_CODE = re.compile(r"^[A-ZА-ЯЁ]/\d{1,2}\.\d$")        # A/01.6
+_RE_OKPDTR = re.compile(r"^\d{4,6}$")                         # 22659
+_RE_NUM_ONLY = re.compile(r"^[\d.\s,]+$")
+
+# Категорийные ключи первой колонки → их типичный набор.
+_CATEGORY_KEYWORDS = {
+    "трудовые действия", "необходимые умения", "необходимые знания",
+    "другие характеристики", "требования к образованию",
+    "требования к опыту", "особые условия допуска",
+    "возможные наименования должностей",
+}
+
+# Текст-метки в "label-row" (одна значимая ячейка), которые потом
+# подкладываются как заголовки нужной колонки.
+_LABEL_HINTS = {
+    "код", "наименование", "регистрационный номер", "дата",
+    "ф.и.о.", "должность", "уровень", "наименование документа",
+}
+
+
+def _column_values(matrix: list[list[str]], idx: int) -> list[str]:
+    return [r[idx].strip() for r in matrix if idx < len(r) and r[idx].strip()]
+
+
+def _all_match(values: list[str], pattern: re.Pattern) -> bool:
+    if not values:
+        return False
+    return all(pattern.match(v) for v in values)
+
+
+def _label_row_hints(matrix: list[list[str]]) -> dict[int, str]:
+    """
+    Ищем строки с ОДНОЙ значимой ячейкой-меткой (например, ['', 'Код'] или
+    ['Наименование', '']). Эти метки — пояснение к соответствующей колонке.
+    Возвращаем {col_idx: label}.
+    """
+    hints: dict[int, str] = {}
+    for row in matrix:
+        non_empty = [(i, c.strip()) for i, c in enumerate(row) if c.strip()]
+        if len(non_empty) != 1:
+            continue
+        i, v = non_empty[0]
+        v_low = v.lower().strip(":.()")
+        if v_low in _LABEL_HINTS:
+            hints.setdefault(i, v.strip(":.() "))
+    return hints
+
+
+def _infer_kv_header(
+    matrix: list[list[str]],
+    doc_header: str,
+    width: int,
+) -> list[str] | None:
+    """
+    Возвращает осмысленные названия колонок (например ["Код ОКЗ", "Наименование"])
+    или None, если эвристика не сработала и нужен fallback "Параметр | Значение".
+    """
+    if not matrix or width < 2:
+        return None
+
+    h = (doc_header or "").lower()
+    col0 = _column_values(matrix, 0)
+    col1 = _column_values(matrix, 1)
+
+    # 1) Контекст из header документа
+    if "группа занятий" in h and width == 2:
+        return ["Код ОКЗ", "Наименование занятия"]
+    if ("видам экономической деятельности" in h
+            or "оквэд" in h) and width == 2:
+        return ["Код ОКВЭД", "Наименование вида экономической деятельности"]
+    if "вид экономической деятельности" in h and width == 2:
+        return ["Код ОКВЭД", "Наименование вида экономической деятельности"]
+    if ("дополнительные характеристики" in h) and width >= 3:
+        return ["Наименование документа", "Код",
+                "Наименование базовой группы, должности или специальности"]
+
+    # 2) По типу первой колонки
+    if width == 2:
+        if _all_match(col0, _RE_CODE_OKZ):
+            return ["Код ОКЗ", "Наименование"]
+        if _all_match(col0, _RE_CODE_OKVED):
+            return ["Код ОКВЭД", "Наименование"]
+        if _all_match(col0, _RE_CODE_PROFSTD):
+            return ["Код профессионального стандарта",
+                    "Наименование вида профессиональной деятельности"]
+        if _all_match(col0, _RE_LETTER_CODE):
+            return ["Код обобщённой трудовой функции", "Наименование"]
+        if _all_match(col0, _RE_FUNC_CODE):
+            return ["Код трудовой функции", "Наименование"]
+
+        # 3) Длинный текст | короткий код  (распространённый случай в проф.стандартах)
+        if (col0 and col1
+                and all(len(v) >= 20 for v in col0)
+                and _all_match(col1, _RE_NUM_ONLY)):
+            return ["Наименование", "Код"]
+        if (col0 and col1
+                and _all_match(col0, _RE_NUM_ONLY)
+                and all(len(v) >= 20 for v in col1)):
+            return ["Код", "Наименование"]
+
+    # 4) Категорийная первая колонка ("Трудовые действия", "Необходимые умения" …)
+    if width == 2 and col0:
+        cat_hits = sum(
+            1 for v in col0
+            if any(v.lower().startswith(k) for k in _CATEGORY_KEYWORDS)
+        )
+        if cat_hits / len(col0) >= 0.5:
+            # для "Требования к ..." уместнее назвать колонки явно
+            if all(v.lower().startswith("требования") or v.lower().startswith("особые")
+                   or v.lower().startswith("другие")
+                   for v in col0):
+                return ["Требование", "Содержание"]
+            return ["Категория", "Содержание"]
+
+    # 5) Подсказки из label-row (`| | Код |`)
+    hints = _label_row_hints(matrix)
+    if hints and width == 2:
+        header_cells = ["", ""]
+        for col_idx, label in hints.items():
+            if col_idx < width:
+                header_cells[col_idx] = label
+        # дозаполняем пустые "семантически"
+        if header_cells[0] and not header_cells[1]:
+            header_cells[1] = "Значение" if header_cells[0] != "Код" else "Наименование"
+        if header_cells[1] and not header_cells[0]:
+            header_cells[0] = "Наименование" if header_cells[1] == "Код" else "Параметр"
+        if any(header_cells):
+            return header_cells
+
+    return None
+
+
+def _try_reshape_inline_pairs(
+    matrix: list[list[str]], doc_header: str
+) -> tuple[list[list[str]], list[str]] | None:
+    """
+    Inline-пары: одна "широкая" строка содержит несколько пар (label/value)
+    подряд из-за gridSpan-разворота.
+
+    Примеры:
+        4 кол.: 1212 | Управляющие | 2149 | Специалисты
+             → 2 кол.: 1212 | Управляющие
+                       2149 | Специалисты
+        6 кол.: Наименование | ВПД | Код | A | Уровень | 6
+             → 2 кол.: Наименование | ВПД
+                       Код | A
+                       Уровень | 6
+
+    Возвращает (new_matrix_2col, semantic_header) или None.
+    """
+    if not matrix:
+        return None
+    # все строки должны иметь чётную ширину >= 4
+    widths = {len(r) for r in matrix}
+    if not widths:
+        return None
+    w = max(widths)
+    if w < 4 or w % 2 != 0:
+        return None
+    # reshape работает ТОЛЬКО когда строк мало (1-2). Это типичный артефакт
+    # gridSpan-разворота одной строки. Иначе мы развалим настоящую data-таблицу.
+    if len(matrix) > 2:
+        return None
+
+    pairs: list[list[str]] = []
+    h = (doc_header or "").lower()
+    code_cols_count = 0
+    label_cols_count = 0
+    code_patterns = [_RE_CODE_OKZ, _RE_CODE_OKVED, _RE_CODE_PROFSTD, _RE_LETTER_CODE]
+
+    for row in matrix:
+        cells = [c.strip() for c in row] + [""] * (w - len(row))
+        for i in range(0, w, 2):
+            a, b = cells[i], cells[i + 1]
+            if not (a or b):
+                continue
+            pairs.append([a, b])
+            # эвристика статистики типов
+            if any(p.match(a) for p in code_patterns):
+                code_cols_count += 1
+            if a and (len(a) <= 40) and not _RE_NUM_ONLY.match(a):
+                label_cols_count += 1
+
+    if len(pairs) < 2:
+        return None
+
+    # выбираем семантическую шапку
+    inferred = _infer_kv_header(pairs, doc_header, 2)
+    if inferred is None:
+        # если в первой колонке pairs стабильно — короткое слово-метка ("Код",
+        # "Наименование", "Уровень" …), то это inline-kv → ["Параметр","Значение"]
+        first_col = [p[0] for p in pairs if p[0]]
+        if first_col and all(len(v) <= 40 for v in first_col):
+            inferred = ["Параметр", "Значение"]
+        else:
+            return None
+
+    return pairs, inferred
+
+
+def _strip_label_rows(matrix: list[list[str]]) -> list[list[str]]:
+    """Удаляем строки-метки (одна значимая ячейка-label), они уже ушли в header."""
+    out: list[list[str]] = []
+    for row in matrix:
+        non_empty = [c.strip() for c in row if c.strip()]
+        if len(non_empty) == 1 and non_empty[0].lower().strip(":.()") in _LABEL_HINTS:
+            continue
+        out.append(row)
+    return out
+
+
+def _matrix_to_markdown(matrix: list[list[str]], kind: str,
+                       doc_header: str = "") -> str:
     """
     Превращает матрицу в одну markdown-таблицу.
     Для kind='kv' использует шапку 'Параметр / Значение'.
@@ -448,30 +715,58 @@ def _matrix_to_markdown(matrix: list[list[str]], kind: str) -> str:
         ).strip()
 
     if kind == "kv":
+        # Сначала убираем "метки-строки" (типа ['', 'Код']) — они станут шапкой
+        clean_matrix = _strip_label_rows(matrix)
+        if not clean_matrix:
+            clean_matrix = matrix
+
+        # Пытаемся развернуть inline-пары (gridSpan-артефакт):
+        # "1212 | Управляющие | 2149 | Специалисты" -> 2 строки по [код, имя].
+        reshape = _try_reshape_inline_pairs(clean_matrix, doc_header)
+        forced_header: list[str] | None = None
+        if reshape is not None:
+            clean_matrix, forced_header = reshape
+
         # Сжимаем дубли в каждой строке (colspan/vMerge артефакты)
         compact_rows: list[list[str]] = []
-        for r in matrix:
+        for r in clean_matrix:
             r2 = _compact_row([c.strip() for c in r])
-            # пустые строки выкидываем
             if not any(r2):
                 continue
             compact_rows.append(r2)
         if not compact_rows:
             return ""
-        # Ширина = max ширина среди строк
         width = max(len(r) for r in compact_rows)
-        # Заголовок: "Параметр | Значение | Значение | ..."
-        if width == 2:
-            header_cells = ["Параметр", "Значение"]
+
+        if forced_header is not None:
+            header_cells = forced_header + [""] * (width - len(forced_header))
+            data_rows = compact_rows
+        elif _looks_like_table_header(compact_rows[0]) and len(compact_rows) > 1:
+            # Настоящая шапка ("Вид инструктажа | В каких случаях …")
+            header_cells = compact_rows[0] + [""] * (width - len(compact_rows[0]))
+            data_rows = compact_rows[1:]
         else:
-            header_cells = ["Параметр"] + ["Значение"] * (width - 1)
+            # Семантический инференс по содержимому/контексту
+            inferred = _infer_kv_header(compact_rows, doc_header, width)
+            if inferred is not None:
+                header_cells = inferred + [""] * (width - len(inferred))
+                data_rows = compact_rows
+            else:
+                # Fallback: "Параметр | Значение"
+                if width == 2:
+                    header_cells = ["Параметр", "Значение"]
+                else:
+                    header_cells = ["Параметр"] + ["Значение"] * (width - 1)
+                data_rows = compact_rows
+
         lines = [
             "| " + " | ".join(header_cells) + " |",
             "|" + "|".join(["---"] * width) + "|",
         ]
-        for r in compact_rows:
-            padded = r + [""] * (width - len(r))
-            lines.append("| " + " | ".join(_md_escape_cell(c) for c in padded) + " |")
+        for r in data_rows:
+            if _is_numbering_row(r):
+                continue
+            lines.append(_render_row_cells(r, width, bold_first=True))
         return "\n".join(lines)
 
     if kind == "data":
@@ -490,8 +785,9 @@ def _matrix_to_markdown(matrix: list[list[str]], kind: str) -> str:
             cells = _compact_row([c.strip() for c in row])
             if not any(cells):
                 continue
-            padded = cells + [""] * (width - len(cells))
-            lines.append("| " + " | ".join(_md_escape_cell(c) for c in padded) + " |")
+            if _is_numbering_row(cells):
+                continue
+            lines.append(_render_row_cells(cells, width, bold_first=True))
         return "\n".join(lines)
 
     # mixed / fallback
@@ -509,12 +805,13 @@ def _matrix_to_markdown(matrix: list[list[str]], kind: str) -> str:
     lines.append("| " + " | ".join(_md_escape_cell(c) if c else "—" for c in h) + " |")
     lines.append("|" + "|".join(["---"] * width) + "|")
     for r in compact_rows[1:]:
-        padded = r + [""] * (width - len(r))
-        lines.append("| " + " | ".join(_md_escape_cell(c) for c in padded) + " |")
+        if _is_numbering_row(r):
+            continue
+        lines.append(_render_row_cells(r, width, bold_first=True))
     return "\n".join(lines)
 
 
-def render_table_markdown(tbl_elem) -> tuple[str, str, list[str]]:
+def render_table_markdown(tbl_elem, doc_header: str = "") -> tuple[str, str, list[str]]:
     """
     Главный рендер таблицы.
     Возвращает: (kind, text, [rId картинок])
@@ -522,6 +819,7 @@ def render_table_markdown(tbl_elem) -> tuple[str, str, list[str]]:
       kind = 'text'   -> text это plain text (single-таблица или после очистки осталась 1 строка)
       kind = ''       -> таблица пуста после очистки
     Правило: 1 таблица = 1 fragment, не режется на чанки.
+    `doc_header` используется для семантического инференса шапки колонок.
     """
     matrix, image_ids = parse_table_matrix(tbl_elem)
     if not matrix:
@@ -532,7 +830,7 @@ def render_table_markdown(tbl_elem) -> tuple[str, str, list[str]]:
         return "", "", image_ids
 
     kind = _classify_table(matrix)
-    md = _matrix_to_markdown(matrix, kind)
+    md = _matrix_to_markdown(matrix, kind, doc_header=doc_header)
     if not md.strip():
         return "", "", image_ids
 
@@ -1239,7 +1537,9 @@ class DocxParser:
 
             elif tag == "tbl":
                 last_was_title = False
-                kind, md, image_ids = render_table_markdown(elem)
+                kind, md, image_ids = render_table_markdown(
+                    elem, doc_header=self.current_header()
+                )
 
                 if md:
                     blk = Block(
