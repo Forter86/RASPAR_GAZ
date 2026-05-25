@@ -1357,6 +1357,11 @@ def parse_one_docx(docx_path: str, out_dir: str) -> str:
     fragments = []
     next_index = 0
     for blk in blocks:
+        # По запросу: служебные/юридические блоки полностью исключаем
+        # из выходного JSON, чтобы они вообще не попадали в индексатор.
+        if not blk.is_indexable:
+            continue
+
         if blk.type == "table":
             chunks = [blk.text] if blk.text else [""]
         elif blk.type == "title":
